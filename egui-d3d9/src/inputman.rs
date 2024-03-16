@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use clipboard::{windows_clipboard::WindowsClipboardContext, ClipboardProvider};
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
 use windows::{
     Wdk::System::SystemInformation::NtQuerySystemTime,
@@ -22,6 +21,8 @@ use windows::{
         },
     },
 };
+
+use crate::get_clipboard_text;
 
 pub struct InputManager {
     hwnd: HWND,
@@ -222,7 +223,7 @@ impl InputManager {
 
                 if let Some(key) = get_key(wparam) {
                     if key == Key::V && modifiers.ctrl {
-                        if let Some(clipboard) = get_clipboard_text() {
+                        if let Some(clipboard) = get_clipboard_text().ok() {
                             self.events.push(Event::Text(clipboard));
                         }
                     }
@@ -240,6 +241,7 @@ impl InputManager {
                         modifiers,
                         key,
                         repeat: lparam & (KF_REPEAT as isize) > 0,
+                        physical_key: None
                     });
                 }
                 InputResult::Key
@@ -254,6 +256,7 @@ impl InputManager {
                         modifiers,
                         key,
                         repeat: false,
+                        physical_key: None
                     });
                 }
                 InputResult::Key
@@ -268,18 +271,19 @@ impl InputManager {
         }
     }
 
-    pub fn collect_input(&mut self) -> RawInput {
+    pub fn collect_input(&mut self, viewport_id: egui::ViewportId) -> RawInput {
         RawInput {
             modifiers: self.modifiers.unwrap_or_default(),
             events: std::mem::take(&mut self.events),
             screen_rect: Some(self.get_screen_rect()),
             time: Some(Self::get_system_time()),
-            pixels_per_point: Some(1.),
+            //pixels_per_point: Some(1.),
             max_texture_side: None,
             predicted_dt: 1. / 60.,
             hovered_files: vec![],
             dropped_files: vec![],
             focused: true,
+            ..Default::default()
         }
     }
 
@@ -379,8 +383,4 @@ fn get_key(wparam: usize) -> Option<Key> {
             _ => None,
         },
     }
-}
-
-fn get_clipboard_text() -> Option<String> {
-    WindowsClipboardContext.get_contents().ok()
 }

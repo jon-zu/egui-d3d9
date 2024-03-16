@@ -1,16 +1,12 @@
-use clipboard::{windows_clipboard::WindowsClipboardContext, ClipboardProvider};
 use egui::{epaint::Primitive, Context};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, RECT, WPARAM},
     Graphics::Direct3D9::{IDirect3DDevice9, D3DPT_TRIANGLELIST, D3DVIEWPORT9},
-    UI::WindowsAndMessaging::GetClientRect,
+    UI::WindowsAndMessaging::{GetClientRect, ShowCursor},
 };
 
 use crate::{
-    inputman::InputManager,
-    mesh::{Buffers, GpuVertex, MeshDescriptor},
-    state::DxState,
-    texman::TextureManager,
+    inputman::InputManager, mesh::{Buffers, GpuVertex, MeshDescriptor}, set_clipboard_text, state::DxState, texman::TextureManager
 };
 
 pub struct EguiDx9<T> {
@@ -83,14 +79,13 @@ impl<T> EguiDx9<T> {
             self.tex_man.reallocate_textures(dev);
         }
 
-        let mut output = self.ctx.run(self.input_man.collect_input(), |ctx| {
+        let output = self.ctx.run(self.input_man.collect_input(self.ctx.viewport_id()), |ctx| {
             // safe. present will never run in parallel.
             (self.ui_fn)(ctx, &mut self.ui_state)
         });
 
         if self.should_reset {
-            output.repaint_after = std::time::Duration::ZERO;
-
+            self.ctx.request_repaint();
             self.should_reset = false;
         }
 
@@ -99,7 +94,7 @@ impl<T> EguiDx9<T> {
         }
 
         if !output.platform_output.copied_text.is_empty() {
-            let _ = WindowsClipboardContext.set_contents(output.platform_output.copied_text);
+            let _ = set_clipboard_text(output.platform_output.copied_text);
         }
 
         if output.shapes.is_empty() {
@@ -111,13 +106,13 @@ impl<T> EguiDx9<T> {
         }
 
         // we only need to update the buffers if we are actually changing something
-        if output.repaint_after.is_zero() || !self.reactive {
+        if self.ctx.has_requested_repaint() || !self.reactive {
             let mut vertices: Vec<GpuVertex> = Vec::with_capacity(self.last_vtx_capacity + 512);
             let mut indices: Vec<u32> = Vec::with_capacity(self.last_idx_capacity + 512);
 
             self.prims = self
                 .ctx
-                .tessellate(output.shapes)
+                .tessellate(output.shapes, output.pixels_per_point)
                 .into_iter()
                 .filter_map(|prim| {
                     if let Primitive::Mesh(mesh) = prim.primitive {
