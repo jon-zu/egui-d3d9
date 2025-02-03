@@ -24,6 +24,14 @@ struct ManagedTexture {
     size: [usize; 2],
 }
 
+impl ManagedTexture {
+    pub fn handle(&self) -> &IDirect3DTexture9 {
+        self.handle
+            .as_ref()
+            .expect("unable to get texture handle")
+    }
+}
+
 pub struct TextureManager {
     textures: HashMap<TextureId, ManagedTexture>,
 }
@@ -37,27 +45,33 @@ impl TextureManager {
 }
 
 impl TextureManager {
-    pub fn process_set_deltas(&mut self, dev: &IDirect3DDevice9, delta: &TexturesDelta) {
-        delta.set.iter().for_each(|(tid, delta)| {
+    pub fn process_set_deltas(
+        &mut self,
+        dev: &IDirect3DDevice9,
+        delta: &TexturesDelta,
+    ) -> windows::core::Result<()> {
+        delta.set.iter().try_for_each(|(tid, delta)| {
             // check if this texture already exists
-            if self.textures.get(tid).is_some() {
+            if self.textures.contains_key(tid) {
                 if delta.is_whole() {
                     // update the entire texture
-                    self.update_texture_whole(dev, tid, &delta.image);
+                    self.update_texture_whole(dev, tid, &delta.image)
                 } else {
                     // update part of the texture
                     self.update_texture_area(
                         dev,
                         tid,
                         &delta.image,
-                        expect!(delta.pos, "unable to extract delta position"),
-                    );
+                        delta.pos.expect("unable to extract delta position"),
+                    )
                 }
             } else {
                 // create new texture
                 self.create_new_texture(dev, tid, &delta.image)
             }
-        });
+        })?;
+
+        Ok(())
     }
 
     pub fn process_free_deltas(&mut self, delta: &TexturesDelta) {
@@ -67,12 +81,13 @@ impl TextureManager {
     }
 
     pub fn get_by_id(&self, id: TextureId) -> &IDirect3DTexture9 {
-        expect!(
-            &expect!(self.textures.get(&id), "unable to retrieve texture")
-                .handle
-                .as_ref(),
-            "unable to retrieve texture handle"
-        )
+        &self
+            .textures
+            .get(&id)
+            .expect("unable to retrieve texture")
+            .handle
+            .as_ref()
+            .expect("unable to retrieve texture handle")
     }
 
     pub fn deallocate_textures(&mut self) {
@@ -83,7 +98,7 @@ impl TextureManager {
 
     pub fn reallocate_textures(&mut self, dev: &IDirect3DDevice9) {
         self.textures.iter_mut().for_each(|(_tid, texture)| {
-            let handle = new_texture_from_buffer(dev, &texture.pixels, texture.size);
+            let handle = new_texture_from_buffer(dev, &texture.pixels, texture.size).expect("text");
 
             texture.handle = Some(handle);
         });
@@ -100,11 +115,11 @@ impl TextureManager {
         dev: &IDirect3DDevice9,
         tid: &TextureId,
         img_data: &ImageData,
-    ) {
+    ) -> windows::core::Result<()> {
         let pixels = pixels_from_imagedata(img_data);
         let size = img_data.size();
 
-        let handle = new_texture_from_buffer(dev, &pixels, size);
+        let handle = new_texture_from_buffer(dev, &pixels, size)?;
 
         self.textures.insert(
             *tid,
@@ -114,6 +129,8 @@ impl TextureManager {
                 size,
             },
         );
+
+        Ok(())
     }
 
     fn update_texture_area(
@@ -122,7 +139,7 @@ impl TextureManager {
         tid: &TextureId,
         img_data: &ImageData,
         pos: [usize; 2],
-    ) {
+    ) -> windows::core::Result<()> {
         let x = pos[0];
         let y = pos[1];
         let w = img_data.width();
@@ -130,39 +147,39 @@ impl TextureManager {
 
         let pixels = pixels_from_imagedata(img_data);
 
-        let temp_tex = create_temporary_texture(dev, &pixels, [w, h]);
+        let temp_tex = create_temporary_texture(dev, &pixels, [w, h])?;
 
         unsafe {
-            let texture = expect!(
-                self.textures.get(tid),
-                "unable to get texture to delta patch"
-            );
+            let texture = self
+                .textures
+                .get(tid)
+                .expect("unable to get texture to delta patch");
 
-            let src_surface = expect!(temp_tex.GetSurfaceLevel(0), "unable to get tex surface");
+            let src_surface = temp_tex.GetSurfaceLevel(0)?;
 
-            let dst_surface = expect!(
-                expect!(texture.handle.as_ref(), "unable to get texture handle").GetSurfaceLevel(0),
-                "unable to get tex surface"
-            );
+            let dst_surface = texture
+                .handle
+                .as_ref()
+                .expect("unable to get texture handle")
+                .GetSurfaceLevel(0)?;
 
-            expect!(
-                dev.UpdateSurface(
-                    &src_surface,
-                    &RECT {
-                        left: 0 as _,
-                        right: w as _,
-                        top: 0 as _,
-                        bottom: h as _,
-                    },
-                    &dst_surface,
-                    &POINT {
-                        x: x as _,
-                        y: y as _,
-                    },
-                ),
-                "unable to update surface"
-            );
+            dev.UpdateSurface(
+                &src_surface,
+                &RECT {
+                    left: 0 as _,
+                    right: w as _,
+                    top: 0 as _,
+                    bottom: h as _,
+                },
+                &dst_surface,
+                &POINT {
+                    x: x as _,
+                    y: y as _,
+                },
+            )?;
         }
+
+        Ok(())
     }
 
     fn update_texture_whole(
@@ -170,19 +187,39 @@ impl TextureManager {
         dev: &IDirect3DDevice9,
         tid: &TextureId,
         img_data: &ImageData,
-    ) {
-        let texture = expect!(self.textures.get_mut(tid), "unable to get texture");
+    ) -> windows::core::Result<()> {
+        let texture = self.textures.get_mut(tid).expect("unable to get texture");
         let size = img_data.size();
 
         let pixels = pixels_from_imagedata(img_data);
 
-        if size != texture.size {
+        if size == texture.size {
+            // perfectly normal update operation
+            let temp_tex = create_temporary_texture(dev, &pixels, size)?;
+
+            let handle = texture.handle();
+            unsafe {
+                handle
+                    .AddDirtyRect(&RECT {
+                        left: 0,
+                        top: 0,
+                        right: size[0] as _,
+                        bottom: size[1] as _,
+                    })?;
+                dev.UpdateTexture(
+                    &temp_tex,
+                    handle
+                )?;
+            }
+
+            texture.pixels = pixels;
+        } else {
             // size mismatch, recreate texture
             // free texture
             self.free(tid);
 
             // create a new texture with new data
-            let handle = new_texture_from_buffer(dev, &pixels, size);
+            let handle = new_texture_from_buffer(dev, &pixels, size)?;
 
             // insert new texture under same key
             self.textures.insert(
@@ -193,34 +230,9 @@ impl TextureManager {
                     size,
                 },
             );
-        } else {
-            // perfectly normal update operation
-            let temp_tex = create_temporary_texture(dev, &pixels, size);
-
-            unsafe {
-                expect!(
-                    expect!(texture.handle.as_ref(), "unable to get texture handle").AddDirtyRect(
-                        &RECT {
-                            left: 0,
-                            top: 0,
-                            right: size[0] as _,
-                            bottom: size[1] as _
-                        }
-                    ),
-                    "unable to dirty texture"
-                );
-
-                expect!(
-                    dev.UpdateTexture(
-                        &temp_tex,
-                        expect!(texture.handle.as_ref(), "unable to get texture handle")
-                    ),
-                    "unable to update texture"
-                );
-            }
-
-            texture.pixels = pixels;
         }
+
+        Ok(())
     }
 }
 
@@ -258,47 +270,38 @@ fn create_temporary_texture(
     dev: &IDirect3DDevice9,
     buf: &[TextureColor],
     size: [usize; 2],
-) -> IDirect3DTexture9 {
+) -> windows::core::Result<IDirect3DTexture9> {
     unsafe {
         let mut temp_texture: Option<IDirect3DTexture9> = None;
 
-        expect!(
-            dev.CreateTexture(
-                size[0] as _,
-                size[1] as _,
-                1,
-                D3DUSAGE_DYNAMIC as _,
-                D3DFMT_A8R8G8B8,
-                D3DPOOL_SYSTEMMEM,
-                &mut temp_texture,
-                std::ptr::null_mut()
-            ),
-            "unable to create temporary texture"
-        );
+        dev.CreateTexture(
+            size[0] as _,
+            size[1] as _,
+            1,
+            D3DUSAGE_DYNAMIC as _,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM,
+            &mut temp_texture,
+            std::ptr::null_mut(),
+        )?;
 
-        let temp_texture = expect!(temp_texture, "unable to create temporary texture");
+        let temp_texture = temp_texture.expect("unable to create temporary texture");
 
         let mut locked_rect = D3DLOCKED_RECT::default();
 
-        expect!(
-            temp_texture.LockRect(
-                0,
-                &mut locked_rect,
-                std::ptr::null_mut(),
-                D3DLOCK_DISCARD as u32 | D3DLOCK_READONLY as u32
-            ),
-            "unable to lock temporary texture"
-        );
+        temp_texture.LockRect(
+            0,
+            &mut locked_rect,
+            std::ptr::null_mut(),
+            D3DLOCK_DISCARD as u32 | D3DLOCK_READONLY as u32,
+        )?;
 
-        std::slice::from_raw_parts_mut(locked_rect.pBits as *mut TextureColor, size[0] * size[1])
+        std::slice::from_raw_parts_mut(locked_rect.pBits.cast::<TextureColor>(), size[0] * size[1])
             .copy_from_slice(buf);
 
-        expect!(
-            temp_texture.UnlockRect(0),
-            "unable to unlock temporary texture"
-        );
+        temp_texture.UnlockRect(0)?;
 
-        temp_texture
+        Ok(temp_texture)
     }
 }
 
@@ -306,32 +309,26 @@ fn new_texture_from_buffer(
     dev: &IDirect3DDevice9,
     buf: &[TextureColor],
     size: [usize; 2],
-) -> IDirect3DTexture9 {
-    let temp_tex = create_temporary_texture(dev, buf, size);
+) -> windows::core::Result<IDirect3DTexture9> {
+    let temp_tex = create_temporary_texture(dev, buf, size)?;
     let mut texture: Option<IDirect3DTexture9> = None;
 
     unsafe {
-        expect!(
-            dev.CreateTexture(
-                size[0] as _,
-                size[1] as _,
-                1,
-                D3DUSAGE_DYNAMIC as _,
-                D3DFMT_A8R8G8B8,
-                D3DPOOL_DEFAULT,
-                &mut texture,
-                std::ptr::null_mut(),
-            ),
-            "unable to create texture"
-        );
+        dev.CreateTexture(
+            size[0] as _,
+            size[1] as _,
+            1,
+            D3DUSAGE_DYNAMIC as _,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+            &mut texture,
+            std::ptr::null_mut(),
+        )?;
 
-        let texture = expect!(texture, "unable to create texture");
+        let texture = texture.expect("unable to create texture");
 
-        expect!(
-            dev.UpdateTexture(&temp_tex, &texture),
-            "unable to upload texture"
-        );
+        dev.UpdateTexture(&temp_tex, &texture)?;
 
-        texture
+        Ok(texture)
     }
 }

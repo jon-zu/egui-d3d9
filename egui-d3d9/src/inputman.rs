@@ -1,8 +1,8 @@
 #![allow(dead_code)]
+use std::time::Instant;
+
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
-use windows::{
-    Wdk::System::SystemInformation::NtQuerySystemTime,
-    Win32::{
+use windows::Win32::{
         Foundation::{HWND, RECT},
         System::SystemServices::{MK_CONTROL, MK_SHIFT},
         UI::{
@@ -19,8 +19,7 @@ use windows::{
                 WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
             },
         },
-    },
-};
+    };
 
 use crate::get_clipboard_text;
 
@@ -28,6 +27,7 @@ pub struct InputManager {
     hwnd: HWND,
     events: Vec<Event>,
     modifiers: Option<Modifiers>,
+    start: Instant,
 }
 
 /// High-level overview of recognized `WndProc` messages.
@@ -46,13 +46,13 @@ pub enum InputResult {
 
 impl InputResult {
     #[inline]
-    pub fn is_valid(&self) -> bool {
+    pub const fn is_valid(&self) -> bool {
         !self.is_unknown()
     }
 
     #[inline]
-    pub fn is_unknown(&self) -> bool {
-        matches!(*self, InputResult::Unknown)
+    pub const fn is_unknown(&self) -> bool {
+        matches!(*self, Self::Unknown)
     }
 }
 
@@ -62,10 +62,14 @@ impl InputManager {
             hwnd,
             events: vec![],
             modifiers: None,
+            start: Instant::now()
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn process(&mut self, umsg: u32, wparam: usize, lparam: isize) -> InputResult {
+        let w_high = (wparam >> 16) as u16;
+
         match umsg {
             WM_MOUSEMOVE => {
                 self.alter_modifiers(get_mouse_modifiers(wparam));
@@ -151,9 +155,9 @@ impl InputManager {
 
                 self.events.push(Event::PointerButton {
                     pos: get_pos(lparam),
-                    button: if (wparam as u32) >> 16 & (XBUTTON1 as u32) != 0 {
+                    button: if w_high & XBUTTON1 != 0 {
                         PointerButton::Extra1
-                    } else if (wparam as u32) >> 16 & (XBUTTON2 as u32) != 0 {
+                    } else if w_high & XBUTTON2 != 0 {
                         PointerButton::Extra2
                     } else {
                         unreachable!()
@@ -169,9 +173,9 @@ impl InputManager {
 
                 self.events.push(Event::PointerButton {
                     pos: get_pos(lparam),
-                    button: if (wparam as u32) >> 16 & (XBUTTON1 as u32) != 0 {
+                    button: if w_high & XBUTTON1 != 0 {
                         PointerButton::Extra1
-                    } else if (wparam as u32) >> 16 & (XBUTTON2 as u32) != 0 {
+                    } else if w_high & XBUTTON2 != 0 {
                         PointerButton::Extra2
                     } else {
                         unreachable!()
@@ -190,30 +194,40 @@ impl InputManager {
                 InputResult::Character
             }
             WM_MOUSEWHEEL => {
-                self.alter_modifiers(get_mouse_modifiers(wparam));
+                let modifiers = get_mouse_modifiers(wparam);
+                self.alter_modifiers(modifiers);
 
-                let delta = (wparam >> 16) as i16 as f32 * 10. / WHEEL_DELTA as f32;
+                let delta = w_high as i16 as f32 * 10. / WHEEL_DELTA as f32;
 
                 if wparam & MK_CONTROL.0 as usize != 0 {
                     self.events
                         .push(Event::Zoom(if delta > 0. { 1.5 } else { 0.5 }));
                     InputResult::Zoom
                 } else {
-                    self.events.push(Event::Scroll(Vec2::new(0., delta)));
+                    self.events.push(Event::MouseWheel {
+                        delta: Vec2::new(0., delta),
+                        unit: egui::MouseWheelUnit::Point,
+                        modifiers,
+                    });
                     InputResult::Scroll
                 }
             }
             WM_MOUSEHWHEEL => {
-                self.alter_modifiers(get_mouse_modifiers(wparam));
+                let modifiers = get_mouse_modifiers(wparam);
+                self.alter_modifiers(modifiers);
 
-                let delta = (wparam >> 16) as i16 as f32 * 10. / WHEEL_DELTA as f32;
+                let delta = w_high as i16 as f32 * 10. / WHEEL_DELTA as f32;
 
                 if wparam & MK_CONTROL.0 as usize != 0 {
                     self.events
                         .push(Event::Zoom(if delta > 0. { 1.5 } else { 0.5 }));
                     InputResult::Zoom
                 } else {
-                    self.events.push(Event::Scroll(Vec2::new(delta, 0.)));
+                    self.events.push(Event::MouseWheel {
+                        delta: Vec2::new(delta, 0.),
+                        unit: egui::MouseWheelUnit::Point,
+                        modifiers,
+                    });
                     InputResult::Scroll
                 }
             }
@@ -223,7 +237,7 @@ impl InputManager {
 
                 if let Some(key) = get_key(wparam) {
                     if key == Key::V && modifiers.ctrl {
-                        if let Some(clipboard) = get_clipboard_text().ok() {
+                        if let Ok(clipboard) = get_clipboard_text() {
                             self.events.push(Event::Text(clipboard));
                         }
                     }
@@ -241,7 +255,7 @@ impl InputManager {
                         modifiers,
                         key,
                         repeat: lparam & (KF_REPEAT as isize) > 0,
-                        physical_key: None
+                        physical_key: None,
                     });
                 }
                 InputResult::Key
@@ -256,7 +270,7 @@ impl InputManager {
                         modifiers,
                         key,
                         repeat: false,
-                        physical_key: None
+                        physical_key: None,
                     });
                 }
                 InputResult::Key
@@ -271,12 +285,13 @@ impl InputManager {
         }
     }
 
-    pub fn collect_input(&mut self, viewport_id: egui::ViewportId) -> RawInput {
+    pub fn collect_input(&mut self) -> RawInput {
+        let time = self.get_system_time();
         RawInput {
             modifiers: self.modifiers.unwrap_or_default(),
             events: std::mem::take(&mut self.events),
             screen_rect: Some(self.get_screen_rect()),
-            time: Some(Self::get_system_time()),
+            time: Some(time),
             //pixels_per_point: Some(1.),
             max_texture_side: None,
             predicted_dt: 1. / 60.,
@@ -288,30 +303,27 @@ impl InputManager {
     }
 
     /// Returns time in seconds.
-    pub fn get_system_time() -> f64 {
-        let mut time = 0;
+    pub fn get_system_time(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+        /*let mut time = 0;
         unsafe {
-            expect!(
-                NtQuerySystemTime(&mut time).ok(),
-                "Failed to get system time"
-            );
+            NtQuerySystemTime(&mut time)
+                .ok()
+                .expect("Failed to get system time");
         }
 
         // dumb ass, read the docs. egui clearly says `in seconds`.
         // Shouldn't have wasted 3 days on this.
         // `NtQuerySystemTime` returns how many 100 nanosecond intervals
         // past since 1st Jan, 1601.
-        (time as f64) / 10_000_000.
+        (time as f64) / 10_000_000.*/
     }
 
     #[inline]
     pub fn get_screen_size(&self) -> Pos2 {
         let mut rect = RECT::default();
         unsafe {
-            expect!(
-                GetClientRect(self.hwnd, &mut rect),
-                "Failed to GetClientRect()"
-            );
+            GetClientRect(self.hwnd, &mut rect).expect("Failed to GetClientRect()");
         }
 
         Pos2::new(
@@ -329,14 +341,14 @@ impl InputManager {
     }
 }
 
-fn get_pos(lparam: isize) -> Pos2 {
+const fn get_pos(lparam: isize) -> Pos2 {
     let x = (lparam & 0xFFFF) as i16 as f32;
-    let y = (lparam >> 16 & 0xFFFF) as i16 as f32;
+    let y = ((lparam >> 16) & 0xFFFF) as i16 as f32;
 
     Pos2::new(x, y)
 }
 
-fn get_mouse_modifiers(wparam: usize) -> Modifiers {
+const fn get_mouse_modifiers(wparam: usize) -> Modifiers {
     Modifiers {
         alt: false,
         ctrl: (wparam & MK_CONTROL.0 as usize) != 0,
@@ -360,27 +372,29 @@ fn get_key_modifiers(msg: u32) -> Modifiers {
 }
 
 fn get_key(wparam: usize) -> Option<Key> {
-    match wparam {
-        0x30..=0x39 => unsafe { Some(std::mem::transmute::<_, Key>(wparam as u8 - 0x1F)) },
-        0x41..=0x5A => unsafe { Some(std::mem::transmute::<_, Key>(wparam as u8 - 0x26)) },
-        0x70..=0x83 => unsafe { Some(std::mem::transmute::<_, Key>(wparam as u8 - 0x3B)) },
+    Some(match wparam {
+        0x30..=0x39 => Key::ALL[(wparam as u8 - 0x1F) as usize],
+        0x41..=0x5A => Key::ALL[(wparam as u8 - 0x26) as usize],
+        0x70..=0x83 => Key::ALL[(wparam as u8 - 0x3b) as usize],
         _ => match VIRTUAL_KEY(wparam as u16) {
-            VK_DOWN => Some(Key::ArrowDown),
-            VK_LEFT => Some(Key::ArrowLeft),
-            VK_RIGHT => Some(Key::ArrowRight),
-            VK_UP => Some(Key::ArrowUp),
-            VK_ESCAPE => Some(Key::Escape),
-            VK_TAB => Some(Key::Tab),
-            VK_BACK => Some(Key::Backspace),
-            VK_RETURN => Some(Key::Enter),
-            VK_SPACE => Some(Key::Space),
-            VK_INSERT => Some(Key::Insert),
-            VK_DELETE => Some(Key::Delete),
-            VK_HOME => Some(Key::Home),
-            VK_END => Some(Key::End),
-            VK_PRIOR => Some(Key::PageUp),
-            VK_NEXT => Some(Key::PageDown),
-            _ => None,
+            VK_DOWN => Key::ArrowDown,
+            VK_LEFT => Key::ArrowLeft,
+            VK_RIGHT => Key::ArrowRight,
+            VK_UP => Key::ArrowUp,
+            VK_ESCAPE => Key::Escape,
+            VK_TAB => Key::Tab,
+            VK_BACK => Key::Backspace,
+            VK_RETURN => Key::Enter,
+            VK_SPACE => Key::Space,
+            VK_INSERT => Key::Insert,
+            VK_DELETE => Key::Delete,
+            VK_HOME => Key::Home,
+            VK_END => Key::End,
+            VK_PRIOR => Key::PageUp,
+            VK_NEXT => Key::PageDown,
+            _ => {
+                return None;
+            }
         },
-    }
+    })
 }

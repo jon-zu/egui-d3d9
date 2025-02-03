@@ -31,112 +31,77 @@ pub struct DxState {
 }
 
 impl DxState {
-    pub fn setup(dev: &IDirect3DDevice9, viewport: D3DVIEWPORT9) -> Self {
+    pub fn setup(dev: &IDirect3DDevice9, viewport: D3DVIEWPORT9) -> windows::core::Result<Self> {
         unsafe {
             // backup state
-            let original_state = {
-                expect!(
-                    dev.CreateStateBlock(D3DSBT_ALL),
-                    "unable to back up game state"
-                )
-            };
+            let original_state = dev.CreateStateBlock(D3DSBT_ALL)?;
 
-            expect!(
-                original_state.Capture(),
-                "unable to capture dx state backup"
-            );
+            original_state.Capture()?;
 
-            let mut original_world: Matrix4x4 = Default::default();
-            let mut original_view: Matrix4x4 = Default::default();
-            let mut original_proj: Matrix4x4 = Default::default();
+            let mut original_world = Matrix4x4::default();
+            let mut original_view = Matrix4x4::default();
+            let mut original_proj = Matrix4x4::default();
 
-            expect!(
-                // https://github.com/apitrace/dxsdk/blob/d964b66467aaa734edbc24326da8119f5f063dd3/Include/d3d9types.h#L333C35-L333C56
-                dev.GetTransform(D3DTRANSFORMSTATETYPE(0 + 256), &mut original_world),
-                "unable to backup world matrix"
-            );
-            expect!(
-                dev.GetTransform(D3DTS_VIEW, &mut original_view),
-                "unable to backup view matrix"
-            );
-            expect!(
-                dev.GetTransform(D3DTS_PROJECTION, &mut original_proj),
-                "unable to backup projection matrix"
-            );
+            dev.GetTransform(D3DTRANSFORMSTATETYPE(256), &mut original_world)?;
 
-            let backbuffer = expect!(
-                dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO),
-                "unable to get original backbuffer"
-            );
+            dev.GetTransform(D3DTS_VIEW, &mut original_view)?;
+
+            dev.GetTransform(D3DTS_PROJECTION, &mut original_proj)?;
+
+            let backbuffer = dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO)?;
 
             // set our desired state
-            expect!(setup_state(dev, viewport), "unable to setup state");
+            setup_state(dev, viewport)?;
 
-            Self {
+            Ok(Self {
                 original_state,
                 original_world,
                 original_view,
                 original_proj,
                 backbuffer,
                 dev: dev.clone(),
-            }
+            })
         }
+    }
+
+    pub fn release(&mut self) -> windows::core::Result<()> {
+        // restore the previous state
+        unsafe {
+            self.dev
+                .SetTransform(D3DTRANSFORMSTATETYPE(256), &self.original_world)?;
+            self.dev.SetTransform(D3DTS_VIEW, &self.original_view)?;
+            self.dev
+                .SetTransform(D3DTS_PROJECTION, &self.original_proj)?;
+
+            let backbuffer = self.dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO)?;
+
+            let render_target = self.dev.GetRenderTarget(0)?;
+
+            self.dev.StretchRect(
+                &render_target,
+                std::ptr::null(),
+                &backbuffer,
+                std::ptr::null(),
+                D3DTEXF_NONE,
+            )?;
+
+            self.dev.SetRenderTarget(0, &self.backbuffer)?;
+
+            self.original_state.Apply()?;
+        }
+
+        Ok(())
     }
 }
 
 impl Drop for DxState {
     fn drop(&mut self) {
-        // restore the previous state
-        unsafe {
-            expect!(
-                self.dev
-                    .SetTransform(D3DTRANSFORMSTATETYPE(0 + 256), &self.original_world),
-                "unable to reset world matrix"
-            );
-            expect!(
-                self.dev.SetTransform(D3DTS_VIEW, &self.original_view),
-                "unable to reset view matrix"
-            );
-            expect!(
-                self.dev.SetTransform(D3DTS_PROJECTION, &self.original_proj),
-                "unable to reset projection matrix"
-            );
-
-            let backbuffer = expect!(
-                self.dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO),
-                "unable to get back buffer"
-            );
-
-            let render_target = expect!(self.dev.GetRenderTarget(0), "unable to get render target");
-
-            expect!(
-                self.dev.StretchRect(
-                    &render_target,
-                    std::ptr::null(),
-                    &backbuffer,
-                    std::ptr::null(),
-                    D3DTEXF_NONE,
-                ),
-                "unable to overwrite back buffer"
-            );
-
-            expect!(
-                self.dev.SetRenderTarget(0, &self.backbuffer),
-                "unable to get original backbuffer"
-            );
-
-            expect!(
-                self.original_state.Apply(),
-                "unable to re-apply captured state"
-            );
-        }
+        self.release().expect("unable to release state");
     }
 }
 
-fn setup_state(
-    dev: &IDirect3DDevice9,
-    viewport: D3DVIEWPORT9,
-) -> Result<(), Box<dyn std::error::Error>> {
+#[allow(clippy::too_many_lines)]
+fn setup_state(dev: &IDirect3DDevice9, viewport: D3DVIEWPORT9) -> windows::core::Result<()> {
     unsafe {
         // general set up
         let backbuffer: IDirect3DSurface9 = dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO)?;
@@ -157,7 +122,7 @@ fn setup_state(
             std::ptr::null_mut(),
         )?;
 
-        let surface = surface.ok_or("unable to create surface")?;
+        let surface = surface.expect("unable to create surface");
 
         dev.SetRenderTarget(0, &surface)?;
 
@@ -209,7 +174,7 @@ fn setup_state(
             M44: 1.0,
         };
 
-        dev.SetTransform(D3DTRANSFORMSTATETYPE(0 + 256), &mat_ident)?;
+        dev.SetTransform(D3DTRANSFORMSTATETYPE(256), &mat_ident)?;
         dev.SetTransform(D3DTS_VIEW, &mat_ident)?;
         dev.SetTransform(D3DTS_PROJECTION, &mat_proj)?;
 
@@ -235,8 +200,8 @@ fn setup_state(
         dev.SetRenderState(D3DRS_STENCILENABLE, false as _)?;
         dev.SetRenderState(D3DRS_CLIPPING, true as _)?;
         dev.SetRenderState(D3DRS_LIGHTING, false as _)?;
-        dev.SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFFFFFF)?;
-        dev.SetRenderState(D3DRS_COLORWRITEENABLE, 0xFFFFFFFF)?;
+        dev.SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFF_FFFF)?;
+        dev.SetRenderState(D3DRS_COLORWRITEENABLE, 0xFFFF_FFFF)?;
         dev.SetRenderState(D3DRS_SRGBWRITEENABLE, false as _)?;
         dev.SetRenderState(D3DRS_LASTPIXEL, true as _)?;
 
@@ -260,7 +225,7 @@ fn setup_state(
         dev.SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR.0 as _)?;
         dev.SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR.0 as _)?;
         dev.SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR.0 as _)?;
-        dev.SetSamplerState(0, D3DSAMP_BORDERCOLOR, 0xFFFFFFFF)?;
+        dev.SetSamplerState(0, D3DSAMP_BORDERCOLOR, 0xFFFF_FFFF)?;
         dev.SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP.0 as _)?;
         dev.SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP.0 as _)?;
         dev.SetSamplerState(0, D3DSAMP_ADDRESSW, D3DTADDRESS_CLAMP.0 as _)?;

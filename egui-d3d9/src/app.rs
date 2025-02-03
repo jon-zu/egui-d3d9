@@ -1,17 +1,29 @@
-use egui::{epaint::Primitive, Context};
+use egui::{epaint::Primitive, Context, TextureId};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, RECT, WPARAM},
-    Graphics::Direct3D9::{IDirect3DDevice9, D3DPT_TRIANGLELIST, D3DVIEWPORT9},
-    UI::WindowsAndMessaging::{GetClientRect, ShowCursor},
+    Graphics::Direct3D9::{IDirect3DDevice9, IDirect3DTexture9, D3DPT_TRIANGLELIST, D3DVIEWPORT9},
+    UI::WindowsAndMessaging::GetClientRect,
 };
 
 use crate::{
-    inputman::InputManager, mesh::{Buffers, GpuVertex, MeshDescriptor}, set_clipboard_text, state::DxState, texman::TextureManager
+    inputman::InputManager,
+    mesh::{Buffers, GpuVertex, MeshDescriptor},
+    set_clipboard_text,
+    state::DxState,
+    texman::TextureManager,
 };
 
-pub struct EguiDx9<T> {
-    ui_fn: Box<dyn FnMut(&Context, &mut T) + 'static>,
-    ui_state: T,
+pub trait UIHandler {
+    fn ui(&mut self, ctx: &Context);
+
+    #[allow(unused_variables)]
+    fn resolve_user_texture(&mut self, id: u64) -> Option<&IDirect3DTexture9> {
+        None
+    }
+}
+
+pub struct EguiDx9<H> {
+    handler: H,
     hwnd: HWND,
     reactive: bool,
     input_man: InputManager,
@@ -23,9 +35,12 @@ pub struct EguiDx9<T> {
     last_idx_capacity: usize,
     last_vtx_capacity: usize,
     should_reset: bool,
+
+    vertices: Vec<GpuVertex>,
+    indices: Vec<u32>,
 }
 
-impl<T> EguiDx9<T> {
+impl<H: UIHandler> EguiDx9<H> {
     ///
     /// initialize the backend.
     ///
@@ -35,30 +50,23 @@ impl<T> EguiDx9<T> {
     ///
     /// the menu doesn't always catch these changes, so only use this if you need to.
     ///
-    pub fn init(
-        dev: &IDirect3DDevice9,
-        hwnd: HWND,
-        ui_fn: impl FnMut(&Context, &mut T) + 'static,
-        ui_state: T,
-        reactive: bool,
-    ) -> Self {
-        if hwnd.0 == 0 {
-            panic!("invalid hwnd specified in egui init");
-        }
-
+    /// # Panics
+    /// If buffers cannot be created
+    pub fn init(dev: &IDirect3DDevice9, hwnd: HWND, handler: H, reactive: bool) -> Self {
         Self {
-            ui_fn: Box::new(ui_fn),
-            ui_state,
+            handler,
             hwnd,
             reactive,
             tex_man: TextureManager::new(),
             input_man: InputManager::new(hwnd),
             ctx: Context::default(),
-            buffers: Buffers::create_buffers(dev, 16384, 16384),
+            buffers: Buffers::create_buffers(dev, 16384, 16384).expect("buffers"),
             prims: Vec::new(),
             last_idx_capacity: 0,
             last_vtx_capacity: 0,
             should_reset: false,
+            vertices: Vec::new(),
+            indices: Vec::new(),
         }
     }
 
@@ -69,19 +77,22 @@ impl<T> EguiDx9<T> {
         self.should_reset = true;
     }
 
-    pub fn present(&mut self, dev: &IDirect3DDevice9) {
+    /// # Panics
+    /// # Errors
+    /// underlying render error
+    pub fn present(&mut self, dev: &IDirect3DDevice9) -> windows::core::Result<()> {
         if unsafe { dev.TestCooperativeLevel() }.is_err() {
-            return;
+            return Ok(());
         }
 
         if self.should_reset {
-            self.buffers = Buffers::create_buffers(dev, 16384, 16384);
+            self.buffers = Buffers::create_buffers(dev, 16384, 16384)?;
             self.tex_man.reallocate_textures(dev);
         }
 
-        let output = self.ctx.run(self.input_man.collect_input(self.ctx.viewport_id()), |ctx| {
+        let output = self.ctx.run(self.input_man.collect_input(), |ctx| {
             // safe. present will never run in parallel.
-            (self.ui_fn)(ctx, &mut self.ui_state)
+            self.handler.ui(ctx);
         });
 
         if self.should_reset {
@@ -90,7 +101,8 @@ impl<T> EguiDx9<T> {
         }
 
         if !output.textures_delta.is_empty() {
-            self.tex_man.process_set_deltas(dev, &output.textures_delta);
+            self.tex_man
+                .process_set_deltas(dev, &output.textures_delta)?;
         }
 
         if !output.platform_output.copied_text.is_empty() {
@@ -102,13 +114,14 @@ impl<T> EguiDx9<T> {
             if !output.textures_delta.is_empty() {
                 self.tex_man.process_free_deltas(&output.textures_delta);
             }
-            return;
+            return Ok(());
         }
 
         // we only need to update the buffers if we are actually changing something
         if self.ctx.has_requested_repaint() || !self.reactive {
-            let mut vertices: Vec<GpuVertex> = Vec::with_capacity(self.last_vtx_capacity + 512);
-            let mut indices: Vec<u32> = Vec::with_capacity(self.last_idx_capacity + 512);
+            // TODO: old code added last len + 512
+            self.vertices.clear();
+            self.indices.clear();
 
             self.prims = self
                 .ctx
@@ -121,8 +134,8 @@ impl<T> EguiDx9<T> {
                         if let Some((gpumesh, verts, idxs)) =
                             MeshDescriptor::from_mesh(mesh, prim.clip_rect)
                         {
-                            vertices.extend_from_slice(verts.as_slice());
-                            indices.extend_from_slice(idxs.as_slice());
+                            self.vertices.extend_from_slice(&verts);
+                            self.indices.extend_from_slice(&idxs);
 
                             Some(gpumesh)
                         } else {
@@ -134,11 +147,11 @@ impl<T> EguiDx9<T> {
                 })
                 .collect();
 
-            self.last_vtx_capacity = vertices.len();
-            self.last_idx_capacity = indices.len();
+            self.last_vtx_capacity = self.vertices.len();
+            self.last_idx_capacity = self.indices.len();
 
-            self.buffers.update_vertex_buffer(dev, &vertices);
-            self.buffers.update_index_buffer(dev, &indices);
+            self.buffers.update_vertex_buffer(dev, &self.vertices)?;
+            self.buffers.update_index_buffer(dev, &self.indices)?;
         }
 
         // back up our state so we don't mess with the game and the game doesn't mess with us.
@@ -147,54 +160,61 @@ impl<T> EguiDx9<T> {
         let _state = DxState::setup(dev, self.get_viewport());
 
         unsafe {
-            expect!(
-                dev.SetStreamSource(
-                    0,
-                    expect!(self.buffers.vtx.as_ref(), "unable to get vertex buffer"),
-                    0,
-                    std::mem::size_of::<GpuVertex>() as _
-                ),
-                "unable to set vertex stream source"
-            );
+            dev.SetStreamSource(
+                0,
+                self.buffers
+                    .vtx
+                    .as_ref()
+                    .expect("unable to get vertex buffer"),
+                0,
+                std::mem::size_of::<GpuVertex>() as _,
+            )?;
 
-            expect!(
-                dev.SetIndices(expect!(
-                    self.buffers.idx.as_ref(),
-                    "unable to get index buffer"
-                ),),
-                "unable to set index buffer"
-            );
+            dev.SetIndices(
+                self.buffers
+                    .idx
+                    .as_ref()
+                    .expect("unable to get index buffer"),
+            )?;
         }
 
         let mut our_vtx_idx: usize = 0;
         let mut our_idx_idx: usize = 0;
 
-        self.prims.iter().for_each(|mesh: &MeshDescriptor| unsafe {
-            expect!(dev.SetScissorRect(&mesh.clip), "unable to set scissor rect");
+        self.prims
+            .iter()
+            .try_for_each(|mesh: &MeshDescriptor| unsafe {
+                dev.SetScissorRect(&mesh.clip)?;
 
-            let texture = self.tex_man.get_by_id(mesh.texture_id);
+                let texture = match mesh.texture_id {
+                    TextureId::Managed(id) => self.tex_man.get_by_id(TextureId::Managed(id)),
+                    TextureId::User(id) => self
+                        .handler
+                        .resolve_user_texture(id)
+                        .expect("unable to resolve user texture"),
+                };
 
-            expect!(dev.SetTexture(0, texture), "unable to set texture");
+                dev.SetTexture(0, texture)?;
 
-            expect!(
                 dev.DrawIndexedPrimitive(
                     D3DPT_TRIANGLELIST,
                     our_vtx_idx as _,
                     0,
                     mesh.vertices as _,
                     our_idx_idx as _,
-                    (mesh.indices / 3usize) as _
-                ),
-                "unable to draw indexed prims"
-            );
+                    (mesh.indices / 3usize) as _,
+                )?;
 
-            our_vtx_idx += mesh.vertices;
-            our_idx_idx += mesh.indices;
-        });
+                our_vtx_idx += mesh.vertices;
+                our_idx_idx += mesh.indices;
+                windows::core::Result::Ok(())
+            })?;
 
         if !output.textures_delta.is_empty() {
             self.tex_man.process_free_deltas(&output.textures_delta);
         }
+
+        Ok(())
     }
 
     #[inline]
@@ -205,17 +225,15 @@ impl<T> EguiDx9<T> {
 }
 
 impl<T> EguiDx9<T> {
-    fn get_screen_size(&self) -> (f32, f32) {
+    #[allow(clippy::cast_sign_loss)]
+    fn get_screen_size(&self) -> (u32, u32) {
         let mut rect = RECT::default();
         unsafe {
-            expect!(
-                GetClientRect(self.hwnd, &mut rect),
-                "Failed to GetClientRect()"
-            );
+            GetClientRect(self.hwnd, &mut rect).expect("Failed to GetClientRect()");
         }
         (
-            (rect.right - rect.left) as f32,
-            (rect.bottom - rect.top) as f32,
+            (rect.right - rect.left) as u32,
+            (rect.bottom - rect.top) as u32,
         )
     }
 
@@ -232,7 +250,7 @@ impl<T> EguiDx9<T> {
     }
 }
 
-impl<T> Drop for EguiDx9<T> {
+impl<H> Drop for EguiDx9<H> {
     fn drop(&mut self) {
         self.buffers.delete_buffers();
         self.tex_man.deallocate_textures();
